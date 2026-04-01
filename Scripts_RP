@@ -1,0 +1,353 @@
+# Neste repositório estarão os dois scripts criados para rodar o pacote REddyProc dentro do RStudio. Só relembrando que ambos foram criados propriamente para os sítios CS120 e CS130, mas podem ser readaptados para a torre que você utilizará.
+
+
+# -------------------------------------------------------------------------- #
+# SCRIPT DA CS120
+
+library(REddyProc)
+library(dplyr)
+library(lubridate)
+grep("(?i)qc|ssitc", colnames(dados_alta), value = TRUE)
+
+# 1. ALTA FREQUÊNCIA (EddyPro)
+dados_alta <- read.csv(
+  "C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/outputeddypro/eddypro_CS_120_fluxnet_2026-03-16T134754_adv.csv",
+  stringsAsFactors = FALSE)
+
+dados_alta <- dados_alta %>%
+  transmute(
+    DateTime = as.POSIXct(as.character(TIMESTAMP_END), format="%Y%m%d%H%M", tz="UTC"),
+    NEE    = na_if(FC, -9999),
+    qc_NEE = as.numeric(FC_SSITC_TEST), 
+    
+    # --- ADICIONADO: Extração do Metano e sua Flag ---
+    CH4    = na_if(FCH4, -9999),
+    qc_CH4 = as.numeric(FCH4_SSITC_TEST),
+    # ------------------------------------------------
+    
+    LE     = na_if(LE, -9999),
+    H      = na_if(H, -9999),
+    Tair   = na_if(TA_EP, -9999),
+    VPD    = na_if(VPD_EP, -9999),
+    Ustar  = na_if(USTAR, -9999))
+
+# 2. BAIXA FREQUÊNCIA 
+caminho_baixa_130 <- "C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/Out_data/outbaixacs130" 
+arquivos_130 <- list.files(caminho_baixa_130, pattern="\\.dat$", full.names=TRUE)
+
+ler_baixa_130 <- function(arq) {
+  df <- read.csv(arq, skip = 1, stringsAsFactors = FALSE)
+  df$DateTime <- ymd_hms(df$TIMESTAMP, tz = "UTC")
+  df %>%
+    transmute(
+      DateTime = ceiling_date(DateTime, "30 minutes"),
+      Rg       = as.numeric(PAR_Den_in) / 2.3)}
+
+dados_baixa_130 <- bind_rows(lapply(arquivos_130, ler_baixa_130)) %>%
+  group_by(DateTime) %>%
+  summarise(across(everything(), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+caminho_baixa_120 <- "C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/Out_data/outbaixacs120" n
+arquivos_120 <- list.files(caminho_baixa_120, pattern="\\.dat$", full.names=TRUE)
+
+ler_baixa_120 <- function(arq) {
+  df <- read.csv(arq, skip = 1, stringsAsFactors = FALSE)
+  df$DateTime <- ymd_hms(df$TIMESTAMP, tz = "UTC")
+  
+  df %>%
+    transmute(
+      DateTime     = ceiling_date(DateTime, "30 minutes"),
+      rH           = as.numeric(RH),
+      Tskin        = as.numeric(Tskin),
+      Tsolo_5cm    = as.numeric(Tsolo_5cm),
+      Tsolo_10cm   = as.numeric(Tsolo_10cm),
+      Tsolo_15cm   = as.numeric(Tsolo_15cm),
+      H2Osolo_10cm = as.numeric(H2Osolo_10cm),
+      Fsolo_10cm   = as.numeric(Fsolo_10cm))}
+
+dados_baixa_120 <- bind_rows(lapply(arquivos_120, ler_baixa_120)) %>%
+  group_by(DateTime) %>%
+  summarise(across(everything(), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+dados_baixa <- full_join(dados_baixa_120, dados_baixa_130, by = "DateTime")
+
+# 3. CRIAÇÃO DO GRID 30 MIN E FUSÃO
+
+tseq <- seq(
+  min(dados_alta$DateTime, na.rm=TRUE),
+  max(dados_alta$DateTime, na.rm=TRUE),
+  by="30 min")
+
+dados_hh <- data.frame(DateTime=tseq) %>%
+  left_join(dados_alta,  by="DateTime") %>%
+  left_join(dados_baixa, by="DateTime")
+
+dados_hh <- dados_hh %>%
+  mutate(across(-DateTime, as.numeric)) %>%
+  mutate(
+    H   = ifelse(H < -100 | H > 500, NA, H),
+    LE  = ifelse(LE < -80  | LE > 800, NA, LE),
+    NEE = ifelse(qc_NEE == 2, NA, NEE),
+    # --- ADICIONADO: Filtro de qualidade do Metano ---
+    CH4 = ifelse(qc_CH4 == 2, NA, CH4),
+    # -------------------------------------------------
+    VPD = ifelse(VPD > 60, NA, VPD),
+    NEE = ifelse(NEE < -30 | NEE > 25, NA, NEE)
+  ) %>%
+  
+  mutate(bloco_14d = floor_date(DateTime, "14 days")) %>%
+  group_by(bloco_14d) %>%
+  mutate(
+    mediana_NEE = median(NEE, na.rm = TRUE),
+    mad_NEE     = mad(NEE, na.rm = TRUE),
+    NEE = ifelse(abs(NEE - mediana_NEE) > (5 * mad_NEE), NA, NEE)
+  ) %>%
+  ungroup() %>%
+  # --- ADICIONADO: Removendo o qc_CH4 ---
+  select(-bloco_14d, -mediana_NEE, -mad_NEE, -qc_NEE, -qc_CH4)
+dados_hh <- as.data.frame(dados_hh)
+
+# 4. CONFIGURAÇÃO REDDYPROC
+
+Eddy <- sEddyProc$new(
+  ID = "CS_120",
+  Data = dados_hh,
+  ColNames = c("NEE", "Rg", "Tair", "VPD", "Ustar", "H", "LE", 
+               "rH", "Tskin", "Tsolo_5cm", "Tsolo_10cm", "Tsolo_15cm", 
+               "H2Osolo_10cm", "Fsolo_10cm"))
+
+Eddy$sSetLocationInfo(LatDeg = -30.44653, LongDeg = -53.19417, TimeZoneHour = -3)
+
+# 5. PREENCHIMENTO DE FALHAS (METEOROLOGIA E ENERGIA)
+
+Eddy$sMDSGapFill("Tair", QFVar = "none", FillAll = TRUE)
+Eddy$sMDSGapFill("VPD",  QFVar = "none", FillAll = TRUE)
+Eddy$sMDSGapFill("Rg",   QFVar = "none", FillAll = TRUE)
+Eddy$sMDSGapFill("rH",           QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Tskin",        QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Tsolo_5cm",    QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Tsolo_10cm",   QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Tsolo_15cm",   QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("H2Osolo_10cm", QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Fsolo_10cm",   QFVar = "none", FillAll = FALSE)
+
+# Fluxos turbulentos
+Eddy$sMDSGapFill("LE", QFVar = "none", FillAll = TRUE)
+Eddy$sMDSGapFill("H",  QFVar = "none", FillAll = TRUE)
+
+# 6. FILTRO DE USTAR E PARTICIONAMENTO 
+# Calcula o Ustar e aplica os limites sazonais
+Eddy$sEstUstarThold()
+Eddy$useSeaonsalUStarThresholds() 
+Eddy$sGetUstarScenarios()
+# AGORA SIM preenche o NEE, descartando os dados com Ustar baixo
+Eddy$sMDSGapFillAfterUstar('NEE', FillAll = FALSE)
+# Particionamento
+Eddy$sMRFluxPartitionUStarScens()
+Eddy$sGLFluxPartitionUStarScens()
+
+# 7. EXPORTAÇÃO
+
+res <- Eddy$sExportResults()
+res$DateTime <- dados_hh$DateTime
+
+# Trazendo de volta as variáveis originais de solo para o CSV final
+res <- res %>%
+  left_join(
+    # --- ADICIONADO: Variável CH4 resgatada aqui ---
+    dados_hh %>% select(DateTime, H, LE, Ustar, rH, Tskin, starts_with("Tsolo"), starts_with("H2O"), starts_with("Fsolo"), CH4),
+    # -----------------------------------------------
+    by = "DateTime")
+
+res_csv <- res %>%
+  mutate(
+    Timestamp = format(DateTime,"%Y-%m-%d %H:%M"),
+    Year = year(DateTime),
+    DoY  = yday(DateTime),
+    Hour = hour(DateTime)+minute(DateTime)/60
+  ) %>%
+  select(Timestamp, Year, DoY, Hour, everything(), -DateTime)
+
+write.csv(res_csv, 
+          "C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/Fillados/CS_120RP_new.csv", 
+          row.names = FALSE)
+
+
+
+
+
+
+
+
+# -------------------------------------------------------------------------- #
+
+
+
+
+
+
+# SCRIPT DA CS130
+
+
+library(REddyProc)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+
+#-------------------------------------------------------------------------------
+
+# 1. ALTA FREQUÊNCIA (EddyPro)
+dados_alta <- read.csv(
+  "C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/outputeddypro/eddypro_CS_130_fluxnet_2026-03-18T143136_adv.csv",
+  stringsAsFactors = FALSE)
+
+dados_alta <- dados_alta %>%
+  transmute(
+    DateTime = as.POSIXct(as.character(TIMESTAMP_END), format="%Y%m%d%H%M", tz="UTC"),
+    DateTime = DateTime + hours(12),
+    
+    NEE    = na_if(FC, -9999),
+    qc_NEE = as.numeric(FC_SSITC_TEST), 
+    CH4    = na_if(FCH4, -9999),
+    qc_CH4 = as.numeric(FCH4_SSITC_TEST),
+    
+    LE     = na_if(LE, -9999),
+    H      = na_if(H, -9999),
+    Tair   = na_if(TA_EP, -9999),
+    VPD    = na_if(VPD_EP, -9999),
+    Ustar  = na_if(USTAR, -9999))
+
+# 2. BAIXA FREQUÊNCIA 
+
+caminho_baixa <- "C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/Out_data/outbaixacs130" 
+arquivos <- list.files(caminho_baixa, pattern="\\.dat$", full.names=TRUE)
+
+ler_baixa <- function(arq) {
+  df <- read.csv(arq, skip = 1, stringsAsFactors = FALSE)
+  df$DateTime <- ymd_hms(df$TIMESTAMP, tz = "UTC")
+  
+  df %>%
+    transmute(
+      DateTime     = ceiling_date(DateTime, "30 minutes"),
+      Rg           = as.numeric(PAR_Den_in) / 2.3,
+      rH           = as.numeric(RH),
+      Tskin        = as.numeric(Tskin),
+      Tsolo_5cm    = as.numeric(Tsolo_5cm),
+      Tsolo_10cm   = as.numeric(Tsolo_10cm),
+      Tsolo_15cm   = as.numeric(Tsolo_15cm),
+      H2Osolo_10cm = as.numeric(H2Osolo_10cm),
+      Fsolo_10cm   = as.numeric(Fsolo_10cm))}
+
+dados_baixa <- bind_rows(lapply(arquivos, ler_baixa)) %>%
+  group_by(DateTime) %>%
+  summarise(across(everything(), ~mean(.x, na.rm = TRUE)), .groups = "drop")
+
+
+# 3. CRIAÇÃO DO GRID 30 MIN E FUSÃO
+
+tseq <- seq(
+  min(dados_alta$DateTime, na.rm=TRUE),
+  max(dados_alta$DateTime, na.rm=TRUE),
+  by="30 min")
+
+dados_hh <- data.frame(DateTime=tseq) %>%
+  left_join(dados_alta,  by="DateTime") %>%
+  left_join(dados_baixa, by="DateTime")
+
+dados_hh <- dados_hh %>%
+  mutate(across(-DateTime, as.numeric)) %>%
+  
+  mutate(
+    NEE = ifelse(DateTime >= as.POSIXct("2025-09-14 00:00:00", tz="UTC") &
+                   DateTime <= as.POSIXct("2025-09-24 00:00:00", tz="UTC"),
+                 NEE * -1,
+                 NEE),
+    NEE = ifelse(NEE < -20 | NEE > 10, NA, NEE)) %>%
+  # -----------------------------------------------------------------
+
+mutate(
+  H   = ifelse(H < -100 | H > 500, NA, H),
+  LE  = ifelse(LE < -80  | LE > 800, NA, LE),
+  NEE = ifelse(qc_NEE == 2, NA, NEE),
+  CH4 = ifelse(qc_CH4 == 2, NA, CH4),
+  VPD = ifelse(VPD > 60, NA, VPD)
+) %>%
+  
+  mutate(bloco_7d = floor_date(DateTime, "7 days")) %>%
+  group_by(bloco_7d) %>%
+  mutate(
+    mediana_NEE = median(NEE, na.rm = TRUE),
+    mad_NEE     = mad(NEE, na.rm = TRUE),
+    NEE = ifelse(abs(NEE - mediana_NEE) > (4.5 * mad_NEE), NA, NEE)
+  ) %>%
+  ungroup() %>%
+  select(-bloco_7d, -mediana_NEE, -mad_NEE, -qc_NEE, -qc_CH4)
+# -----------------------------------------------------
+
+dados_hh <- as.data.frame(dados_hh)
+
+# 4. CONFIGURAÇÃO REDDYPROC
+
+Eddy <- sEddyProc$new(
+  ID = "CS_130",
+  Data = dados_hh,
+  ColNames = c("NEE", "Rg", "Tair", "VPD", "Ustar", "H", "LE", 
+               "rH", "Tskin", "Tsolo_5cm", "Tsolo_10cm", "Tsolo_15cm", 
+               "H2Osolo_10cm", "Fsolo_10cm"))
+
+Eddy$sSetLocationInfo(LatDeg = -30.43264, LongDeg = -53.18264, TimeZoneHour = -3)
+
+# 5. PREENCHIMENTO DE FALHAS (METEOROLOGIA E ENERGIA)
+
+Eddy$sMDSGapFill("Tair", QFVar = "none", FillAll = TRUE)
+Eddy$sMDSGapFill("VPD",  QFVar = "none", FillAll = TRUE)
+Eddy$sMDSGapFill("Rg",   QFVar = "none", FillAll = TRUE)
+Eddy$sMDSGapFill("rH",           QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Tskin",        QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Tsolo_5cm",    QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Tsolo_10cm",   QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Tsolo_15cm",   QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("H2Osolo_10cm", QFVar = "none", FillAll = FALSE)
+Eddy$sMDSGapFill("Fsolo_10cm",   QFVar = "none", FillAll = FALSE)
+
+# Fluxos turbulentos
+Eddy$sMDSGapFill("LE", QFVar = "none", FillAll = TRUE)
+Eddy$sMDSGapFill("H",  QFVar = "none", FillAll = TRUE)
+
+# 6. FILTRO DE USTAR E PARTICIONAMENTO 
+Eddy$sEstUstarThold()
+Eddy$useSeaonsalUStarThresholds() 
+Eddy$sGetUstarScenarios()
+Eddy$sMDSGapFillAfterUstar('NEE', FillAll = FALSE)
+Eddy$sMRFluxPartitionUStarScens()
+Eddy$sGLFluxPartitionUStarScens()
+
+# 7. EXPORTAÇÃO
+
+res <- Eddy$sExportResults()
+res$DateTime <- dados_hh$DateTime
+
+# Trazendo de volta as variáveis originais de solo para o CSV final
+res <- res %>%
+  left_join(
+    # --- ADICIONADO: A variável CH4 é puxada do dados_hh original ---
+    dados_hh %>% select(DateTime, H, LE, Ustar, rH, Tskin, starts_with("Tsolo"), starts_with("H2O"), starts_with("Fsolo"), CH4),
+    # ----------------------------------------------------------------
+    by = "DateTime")
+
+res_csv <- res %>%
+  mutate(
+    Timestamp = format(DateTime,"%Y-%m-%d %H:%M"),
+    Year = year(DateTime),
+    DoY  = yday(DateTime),
+    Hour = hour(DateTime)+minute(DateTime)/60
+  ) %>%
+  select(Timestamp, Year, DoY, Hour, everything(), -DateTime)
+
+res_csv <- res_csv %>%
+  mutate(
+    NEE_uStar_f = ifelse(NEE_uStar_f < -40 | NEE_uStar_f > 22, NA, NEE_uStar_f))
+
+write.csv(res_csv, 
+          "C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/Fillados/CS_130RP_new.csv", 
+          row.names = FALSE)
