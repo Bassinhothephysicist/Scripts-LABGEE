@@ -1,3 +1,9 @@
+# Os scripts em questão são modelos-teste de gap-filling usando machine learning, feitos nos sítios CS120 e CS130. O principal gira em torno do XGBoost, adaptado com MDC e alguns filtros, incluindo um de u*. 
+# A estrututura do código em si é bem simples e faz uso de um arquivo "fluxnet" que sai diretamente do EddyPro. 
+# Quando desenvolvi, não tinha dados de NDVI, que seriam bem úteis. Da mesma forma, é um modelo válido e consistente, até mais seguro que o REddyProc num geral.
+
+
+
 import pandas as pd
 import numpy as np
 import xgboost as xgb
