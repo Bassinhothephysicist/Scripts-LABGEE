@@ -1,7 +1,7 @@
 # Os scripts em questão são modelos-teste de gap-filling usando machine learning, feitos nos sítios CS120 e CS130. O principal gira em torno do XGBoost, adaptado com MDC e alguns filtros, incluindo um de u*. 
 # A estrututura do código em si é bem simples e faz uso de um arquivo "fluxnet" que sai diretamente do EddyPro. 
 # Quando desenvolvi, não tinha dados de NDVI, que seriam bem úteis. Da mesma forma, é um modelo válido e consistente, até mais seguro que o REddyProc num geral.
-
+# Os primeiros dois scrips são de preenchimento de NEE, e os outros dois de CH4; para a C120 e CS130, respectivamente.
 
 
 import pandas as pd
@@ -201,3 +201,273 @@ for ax in [ax1, ax2, ax3]:
     ax.tick_params(axis='both', which='major', labelsize=10)
 plt.tight_layout()
 plt.show()
+
+
+
+
+
+
+
+
+# ==============================================================================
+# 1. LOAD & PREP (CH4 - CS120)
+# ==============================================================================
+path = r"C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/outputeddypro/eddypro_CS_120_fluxnet_2026-03-16T134754_adv.csv"
+df = pd.read_csv(path, skiprows=[1], na_values=[-9999, -9999.0])
+df.index = pd.to_datetime(df['TIMESTAMP_START'].astype(str), format='%Y%m%d%H%M')
+
+# ---> REMOVENDO DUPLICATAS DO ARQUIVO FLUXNET <---
+df = df.sort_index()
+df = df[~df.index.duplicated(keep='first')]
+
+# Variáveis temporais originais
+df['DOY'], df['Hour'], df['Month'] = df.index.dayofyear, df.index.hour, df.index.month
+
+# Engenharia de Features Sazonais
+df['is_day'] = ((df['Hour'] > 5) & (df['Hour'] < 19)).astype(int)
+df['Hour_sin'] = np.sin(2 * np.pi * df['Hour'] / 24)
+df['Hour_cos'] = np.cos(2 * np.pi * df['Hour'] / 24)
+df['DOY_sin']  = np.sin(2 * np.pi * df['DOY'] / 365)
+df['DOY_cos']  = np.cos(2 * np.pi * df['DOY'] / 365)
+
+# ------------------------------------------------------------------------------
+# FUSÃO DOS DADOS DO DATALOGGER (cs120b) COM O EDDYPRO (df)
+# ------------------------------------------------------------------------------
+# ATENÇÃO: Garanta que o cs120b já esteja carregado no seu ambiente e com o 
+# índice configurado como datetime antes de rodar esta etapa!
+
+# ---> REMOVENDO DUPLICATAS DO ARQUIVO DO DATALOGGER <---
+cs120b = cs120b.sort_index()
+cs120b = cs120b[~cs120b.index.duplicated(keep='first')]
+
+# Selecionamos as colunas de ouro e juntamos ao df principal
+colunas_biomet = ['Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm']
+df = df.join(cs120b[colunas_biomet], how='left')
+
+# ------------------------------------------------------------------------------
+# CONFIGURAÇÃO DE ALVO E CONVERSÃO
+# ------------------------------------------------------------------------------
+target = 'FCH4' 
+
+# ---> CONVERSÃO: nmol para µmol (dividindo por 1000) <---
+df[target] = df[target] / 1000
+
+feats = [
+    'TA_EP', 'VPD_EP', 'USTAR',           
+    'is_day', 'Hour_sin', 'Hour_cos',     
+    'DOY_sin', 'DOY_cos',                 
+    'Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm'
+]
+
+# ==============================================================================
+# 2. QUALITY CONTROL ESPECÍFICO (CH4)
+# ==============================================================================
+if 'FCH4_SSITC_TEST' in df.columns: 
+    df.loc[df['FCH4_SSITC_TEST'] == 2, target] = np.nan
+
+# Limites ajustados para a escala em µmol
+df.loc[(df[target] < -0.05) | (df[target] > 0.5), target] = np.nan 
+
+df['CH4_filled'] = df[target].copy()
+
+# ==============================================================================
+# 3. XGBOOST TRAINING
+# ==============================================================================
+clean = df.dropna(subset=feats + [target])
+X_train, X_test, y_train, y_test = train_test_split(clean[feats], clean[target], test_size=0.2, random_state=42)
+
+model = xgb.XGBRegressor(n_estimators=200, learning_rate=0.03, max_depth=5).fit(X_train, y_train)
+
+# ==============================================================================
+# 4. GAP FILLING (SEGURANÇA MÁXIMA - CORTANDO MALES PELA RAIZ)
+# ==============================================================================
+# 1. MAPEAMENTO DOS BURACOS ORIGINAIS (Antes de qualquer preenchimento)
+buracos_originais = df[target].isna()
+# Define buracos maiores que 24 horas (48 meias-horas) como "intocáveis"
+buracos_intocaveis = buracos_originais & (buracos_originais.groupby((~buracos_originais).cumsum()).transform('sum') > 48)
+
+# 2. Preenchimento via Machine Learning (onde há dados meteorológicos)
+mask_ml = df['CH4_filled'].isna() & df[feats].notna().all(axis=1)
+df.loc[mask_ml, 'CH4_filled'] = model.predict(df.loc[mask_ml, feats])
+
+# 3. Interpolação curta para fechar buraquinhos (máximo 2 horas)
+df['CH4_filled'] = df['CH4_filled'].interpolate(method='time', limit=4)
+
+# 4. MDC (Mean Diurnal Cycle) para os buracos médios restantes
+mdc_ch4 = df.groupby(['Month', 'Hour'])['CH4_filled'].transform('mean')
+df.loc[df['CH4_filled'].isna(), 'CH4_filled'] = mdc_ch4
+
+# ---> 5. A MARRETADA FINAL <---
+# Apaga qualquer preenchimento (seja de ML ou MDC) que tenha caído em um buraco intocável
+df.loc[buracos_intocaveis, 'CH4_filled'] = np.nan
+
+# ==============================================================================
+# 5. PUBLICATION-READY PLOT (2 PANELS)
+# ==============================================================================
+daily = df['CH4_filled'].resample('D').mean()
+
+plt.rcParams.update({'font.size': 11, 'font.family': 'serif'})
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, dpi=150)
+
+# Panel (a): Half-hourly
+ax1.plot(df.index, df['CH4_filled'], color='#ff7f0e', lw=0.6, label='Gap-filled (XGBoost + MDC)', alpha=0.9)
+ax1.plot(df.index, df[target], color='#1f77b4', lw=0.6, label='Measured', alpha=0.7)
+ax1.set_ylabel('CH₄ Flux (µmol m⁻² s⁻¹)', fontweight='bold')
+ax1.set_title('(a) Half-hourly Methane Flux - CS120', loc='left', fontweight='bold')
+ax1.axhline(0, color='black', ls='-', lw=0.8)
+ax1.legend(loc='upper right', frameon=True, edgecolor='black')
+
+# Panel (b): Daily Mean
+ax2.plot(daily.index, daily, color='#2ca02c', lw=1.5, label='Daily Mean CH₄')
+ax2.set_ylabel('CH₄ Flux (µmol m⁻² s⁻¹)', fontweight='bold')
+ax2.set_title('(b) Daily Mean Methane Flux - CS120', loc='left', fontweight='bold')
+ax2.set_xlabel('Date', fontweight='bold')
+ax2.axhline(0, color='black', ls='-', lw=0.8)
+ax2.legend(loc='upper right', frameon=True, edgecolor='black')
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+
+for ax in [ax1, ax2]:
+    ax.grid(True, ls=':', alpha=0.6, color='gray')
+    ax.tick_params(axis='both', which='major', labelsize=10)
+
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
+
+# ==============================================================================
+# 1. LOAD & PREP (CH4 - CS130)
+# ==============================================================================
+path = r"C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/outputeddypro/eddypro_CS_130_fluxnet_2026-03-18T143136_adv.csv"
+df = pd.read_csv(path, skiprows=[1], na_values=[-9999, -9999.0])
+df.index = pd.to_datetime(df['TIMESTAMP_START'].astype(str), format='%Y%m%d%H%M')
+
+# ---> REMOVENDO DUPLICATAS DO ARQUIVO FLUXNET <---
+df = df.sort_index()
+df = df[~df.index.duplicated(keep='first')]
+
+# Variáveis temporais originais
+df['DOY'], df['Hour'], df['Month'] = df.index.dayofyear, df.index.hour, df.index.month
+
+# Engenharia de Features Sazonais
+df['is_day'] = ((df['Hour'] > 5) & (df['Hour'] < 19)).astype(int)
+df['Hour_sin'] = np.sin(2 * np.pi * df['Hour'] / 24)
+df['Hour_cos'] = np.cos(2 * np.pi * df['Hour'] / 24)
+df['DOY_sin']  = np.sin(2 * np.pi * df['DOY'] / 365)
+df['DOY_cos']  = np.cos(2 * np.pi * df['DOY'] / 365)
+
+# ------------------------------------------------------------------------------
+# FUSÃO DOS DADOS DO DATALOGGER (cs130b) COM O EDDYPRO (df)
+# ------------------------------------------------------------------------------
+# ATENÇÃO: Garanta que o cs130b já esteja carregado no seu ambiente e com o 
+# índice configurado como datetime antes de rodar esta etapa!
+
+# ---> REMOVENDO DUPLICATAS DO ARQUIVO DO DATALOGGER <---
+cs130b = cs130b.sort_index()
+cs130b = cs130b[~cs130b.index.duplicated(keep='first')]
+
+# Selecionamos as colunas de ouro e juntamos ao df principal
+colunas_biomet = ['Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm']
+df = df.join(cs130b[colunas_biomet], how='left')
+
+# ------------------------------------------------------------------------------
+# CONFIGURAÇÃO DE ALVO E CONVERSÃO
+# ------------------------------------------------------------------------------
+target = 'FCH4' 
+
+# ---> CONVERSÃO: nmol para µmol (dividindo por 1000) <---
+df[target] = df[target] / 1000
+
+feats = [
+    'TA_EP', 'VPD_EP', 'USTAR',           
+    'is_day', 'Hour_sin', 'Hour_cos',     
+    'DOY_sin', 'DOY_cos',                 
+    'Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm'
+]
+
+# ==============================================================================
+# 2. QUALITY CONTROL ESPECÍFICO (CH4)
+# ==============================================================================
+if 'FCH4_SSITC_TEST' in df.columns: 
+    df.loc[df['FCH4_SSITC_TEST'] == 2, target] = np.nan
+
+# Limites ajustados para a escala em µmol
+df.loc[(df[target] < -0.05) | (df[target] > 0.5), target] = np.nan 
+
+df['CH4_filled'] = df[target].copy()
+
+# ==============================================================================
+# 3. XGBOOST TRAINING
+# ==============================================================================
+clean = df.dropna(subset=feats + [target])
+X_train, X_test, y_train, y_test = train_test_split(clean[feats], clean[target], test_size=0.2, random_state=42)
+
+model = xgb.XGBRegressor(n_estimators=200, learning_rate=0.03, max_depth=5).fit(X_train, y_train)
+
+# ==============================================================================
+# 4. GAP FILLING (SEGURANÇA MÁXIMA - CORTANDO MALES PELA RAIZ)
+# ==============================================================================
+# 1. MAPEAMENTO DOS BURACOS ORIGINAIS (Antes de qualquer preenchimento)
+buracos_originais = df[target].isna()
+# Define buracos maiores que 24 horas (48 meias-horas) como "intocáveis"
+buracos_intocaveis = buracos_originais & (buracos_originais.groupby((~buracos_originais).cumsum()).transform('sum') > 48)
+
+# 2. Preenchimento via Machine Learning (onde há dados meteorológicos)
+mask_ml = df['CH4_filled'].isna() & df[feats].notna().all(axis=1)
+df.loc[mask_ml, 'CH4_filled'] = model.predict(df.loc[mask_ml, feats])
+
+# 3. Interpolação curta para fechar buraquinhos (máximo 2 horas)
+df['CH4_filled'] = df['CH4_filled'].interpolate(method='time', limit=4)
+
+# 4. MDC (Mean Diurnal Cycle) para os buracos médios restantes
+mdc_ch4 = df.groupby(['Month', 'Hour'])['CH4_filled'].transform('mean')
+df.loc[df['CH4_filled'].isna(), 'CH4_filled'] = mdc_ch4
+
+# ---> 5. A MARRETADA FINAL <---
+# Apaga qualquer preenchimento (seja de ML ou MDC) que tenha caído em um buraco intocável
+df.loc[buracos_intocaveis, 'CH4_filled'] = np.nan
+
+# ==============================================================================
+# 5. PUBLICATION-READY PLOT (2 PANELS)
+# ==============================================================================
+daily = df['CH4_filled'].resample('D').mean()
+
+plt.rcParams.update({'font.size': 11, 'font.family': 'serif'})
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, dpi=150)
+
+# Panel (a): Half-hourly
+ax1.plot(df.index, df['CH4_filled'], color='#ff7f0e', lw=0.6, label='Gap-filled (XGBoost + MDC)', alpha=0.9)
+ax1.plot(df.index, df[target], color='#1f77b4', lw=0.6, label='Measured', alpha=0.7)
+ax1.set_ylabel('CH₄ Flux (µmol m⁻² s⁻¹)', fontweight='bold')
+ax1.set_title('(a) Half-hourly Methane Flux - CS130', loc='left', fontweight='bold')
+ax1.axhline(0, color='black', ls='-', lw=0.8)
+ax1.legend(loc='upper right', frameon=True, edgecolor='black')
+
+# Panel (b): Daily Mean
+ax2.plot(daily.index, daily, color='#2ca02c', lw=1.5, label='Daily Mean CH₄')
+ax2.set_ylabel('CH₄ Flux (µmol m⁻² s⁻¹)', fontweight='bold')
+ax2.set_title('(b) Daily Mean Methane Flux - CS130', loc='left', fontweight='bold')
+ax2.set_xlabel('Date', fontweight='bold')
+ax2.axhline(0, color='black', ls='-', lw=0.8)
+ax2.legend(loc='upper right', frameon=True, edgecolor='black')
+ax2.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+
+for ax in [ax1, ax2]:
+    ax.grid(True, ls=':', alpha=0.6, color='gray')
+    ax.tick_params(axis='both', which='major', labelsize=10)
+
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
+
+
+
