@@ -1,7 +1,13 @@
-# Os scripts em questão são modelos-teste de gap-filling usando machine learning, feitos nos sítios CS120 e CS130. O principal gira em torno do XGBoost, adaptado com MDC e alguns filtros, incluindo um de u*. 
-# A estrututura do código em si é bem simples e faz uso de um arquivo "fluxnet" que sai diretamente do EddyPro. 
-# Quando desenvolvi, não tinha dados de NDVI, que seriam bem úteis. Da mesma forma, é um modelo válido e consistente, até mais seguro que o REddyProc num geral.
-# Os primeiros dois scrips são de preenchimento de NEE, e os outros dois de CH4; para a C120 e CS130, respectivamente.
+Os scripts em questão são modelos-teste de gap-filling usando machine learning, feitos nos sítios CS120 e CS130. O principal gira em torno do XGBoost, adaptado com MDC e alguns filtros, incluindo um de u*. 
+A estrututura do código em si é bem simples e faz uso de um arquivo "fluxnet" que sai diretamente do EddyPro. 
+Quando desenvolvi, não tinha dados de NDVI, que seriam bem úteis. Da mesma forma, é um modelo válido e consistente, até mais seguro que o REddyProc num geral.
+Os primeiros dois scrips são de preenchimento de NEE, e os outros dois de CH4; para a C120 e CS130, respectivamente.
+
+Outro ponto importante que adicionei dentro destes scripts foi o uso de dados de NDVI, que estarão reorganizados em um script no final deste diretório.
+Retirei eles através do site da Copernicus, usando o Sentinel-2 de base e a área do sítio em questão (sim, isto deve ser feito manualmente ao longo de todo o 
+período de análise). É válido destacar que os dados de NDVI fortalecem muito este modelo, pois o Machine Learning consegue se embasar em dados de satélite
+que garantem que a cobertura vegetal é aquela mesmo, aprimorando ainda mais o modelo em questão.
+
 
 
 import pandas as pd
@@ -16,11 +22,24 @@ import glob
 # GAP_FILLING com XGBOOST na CS120
 
 # ==============================================================================
-# 1. LOAD & PREP (CS120) 
+# 1. LOAD & PREP (CS120)
 # ==============================================================================
 path = r"C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/outputeddypro/eddypro_CS_120_fluxnet_2026-03-16T134754_adv.csv"
 df = pd.read_csv(path, skiprows=[1], na_values=[-9999, -9999.0])
 df.index = pd.to_datetime(df['TIMESTAMP_START'].astype(str), format='%Y%m%d%H%M')
+
+# ---> MAGIA DO NDVI ACONTECENDO AQUI <---
+# 1. Junta as colunas do df_ndvi com a torre (o Pandas alinha as datas automaticamente)
+df = df.join(ndvi120[['NDVI_Medio', 'NDVI_Desvio']], how='left')
+
+# 2. Interpola os buracos de meia em meia hora criando uma rampa suave entre os dias de satélite
+df['NDVI_Medio'] = df['NDVI_Medio'].interpolate(method='time')
+df['NDVI_Desvio'] = df['NDVI_Desvio'].interpolate(method='time')
+
+# 3. Caso tenha sobrado buraco no começo ou no fim da série (antes da 1ª imagem), a gente repete o valor
+df['NDVI_Medio'] = df['NDVI_Medio'].bfill().ffill()
+df['NDVI_Desvio'] = df['NDVI_Desvio'].bfill().ffill()
+# -----------------------------------------
 
 # Manter Month e Hour originais apenas para o MDC depois
 df['DOY'], df['Hour'], df['Month'] = df.index.dayofyear, df.index.hour, df.index.month
@@ -35,9 +54,12 @@ df['Hour_cos'] = np.cos(2 * np.pi * df['Hour'] / 24)
 df['DOY_sin']  = np.sin(2 * np.pi * df['DOY'] / 365)
 df['DOY_cos']  = np.cos(2 * np.pi * df['DOY'] / 365)
 
-# 3. Atualização da lista de features para o XGBoost
+# 3. Atualização da lista de features para o XGBoost (AGORA COM NDVI!)
 target = 'FC'
-feats = ['TA_EP', 'RH_EP', 'VPD_EP', 'USTAR', 'is_day', 'Hour_sin', 'Hour_cos', 'DOY_sin', 'DOY_cos']
+feats = [
+    'TA_EP', 'RH_EP', 'VPD_EP', 'USTAR', 
+    'is_day', 'Hour_sin', 'Hour_cos', 'DOY_sin', 'DOY_cos', 
+    'NDVI_Medio', 'NDVI_Desvio']
 
 # ==============================================================================
 # 2. QUALITY CONTROL & U* FILTER
@@ -105,6 +127,11 @@ for ax in [ax1, ax2]:
 plt.tight_layout()
 plt.show()
 
+xgb.plot_importance(model, height=0.5, max_num_features=15, color='#1f77b4')
+plt.title('Importância das Variáveis no XGBoost')
+plt.tight_layout()
+plt.show()
+
 
 
 
@@ -118,6 +145,13 @@ plt.show()
 path = r"C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/outputeddypro/eddypro_CS_130_fluxnet_2026-03-18T143136_adv.csv"
 df = pd.read_csv(path, skiprows=[1], na_values=[-9999, -9999.0])
 df.index = pd.to_datetime(df['TIMESTAMP_START'].astype(str), format='%Y%m%d%H%M')
+
+# ---> INSERÇÃO DO NDVI DA CS130 <---
+# Junta o dataframe do satélite com a torre e interpola os buracos
+df = df.join(ndvi130[['NDVI_Medio', 'NDVI_Desvio']], how='left')
+df['NDVI_Medio'] = df['NDVI_Medio'].interpolate(method='time').bfill().ffill()
+df['NDVI_Desvio'] = df['NDVI_Desvio'].interpolate(method='time').bfill().ffill()
+# -----------------------------------
 
 # Manter originais para o MDC
 df['DOY'], df['Hour'], df['Month'] = df.index.dayofyear, df.index.hour, df.index.month
@@ -133,7 +167,8 @@ df['DOY_sin']  = np.sin(2 * np.pi * df['DOY'] / 365)
 df['DOY_cos']  = np.cos(2 * np.pi * df['DOY'] / 365)
 
 target = 'FC'
-feats = ['TA_EP', 'RH_EP', 'VPD_EP', 'USTAR', 'is_day', 'Hour_sin', 'Hour_cos', 'DOY_sin', 'DOY_cos']
+# O NDVI AGORA FAZ PARTE DO TREINAMENTO!
+feats = ['TA_EP', 'RH_EP', 'VPD_EP', 'USTAR', 'is_day', 'Hour_sin', 'Hour_cos', 'DOY_sin', 'DOY_cos', 'NDVI_Medio', 'NDVI_Desvio']
 
 # ==============================================================================
 # 2. QUALITY CONTROL & U* FILTER
@@ -180,7 +215,8 @@ daily = df['FC_filled'].resample('D').mean()
 
 # Article style configurations
 plt.rcParams.update({'font.size': 11, 'font.family': 'serif'})
-# Aumentei a altura da figura para acomodar o terceiro painel
+
+# Ajustado para 3 painéis (ax1, ax2, ax3)
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 11), sharex=True, dpi=150)
 # Panel (a): Half-hourly
 ax1.plot(df.index, df['FC_filled'], color='#d62728', lw=0.6, label='Gap-filled (XGBoost + MDC)', alpha=0.9)
@@ -189,6 +225,7 @@ ax1.set_ylabel('NEE ($\mu$mol m⁻² s⁻¹)', fontweight='bold')
 ax1.set_title('(a) Half-hourly Net Ecosystem Exchange - CS130', loc='left', fontweight='bold')
 ax1.axhline(0, color='black', ls='-', lw=0.8)
 ax1.legend(loc='upper right', frameon=True, edgecolor='black')
+
 # Panel (b): Daily Mean
 ax2.plot(daily.index, daily, color='#2ca02c', lw=1.5, label='Daily Mean NEE')
 ax2.set_ylabel('NEE ($\mu$mol m⁻² s⁻¹)', fontweight='bold')
@@ -196,12 +233,16 @@ ax2.set_title('(b) Daily Mean Net Ecosystem Exchange - CS130', loc='left', fontw
 ax2.axhline(0, color='black', ls='-', lw=0.8)
 ax2.legend(loc='upper right', frameon=True, edgecolor='black')
 
-for ax in [ax1, ax2, ax3]:
+for ax in [ax1, ax2]:
     ax.grid(True, ls=':', alpha=0.6, color='gray')
     ax.tick_params(axis='both', which='major', labelsize=10)
+
 plt.tight_layout()
 plt.show()
 
+xgb.plot_importance(model, height=0.5, max_num_features=15, color='#1f77b4')
+plt.tight_layout()
+plt.show()
 
 
 
@@ -216,89 +257,64 @@ path = r"C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/outputeddypro/eddypro_CS_
 df = pd.read_csv(path, skiprows=[1], na_values=[-9999, -9999.0])
 df.index = pd.to_datetime(df['TIMESTAMP_START'].astype(str), format='%Y%m%d%H%M')
 
-# ---> REMOVENDO DUPLICATAS DO ARQUIVO FLUXNET <---
+# Limpeza de duplicatas inicial
 df = df.sort_index()
 df = df[~df.index.duplicated(keep='first')]
 
-# Variáveis temporais originais
-df['DOY'], df['Hour'], df['Month'] = df.index.dayofyear, df.index.hour, df.index.month
+# --- FUSÃO BIOMET (Datalogger) ---
+cs120b = cs120b.sort_index()
+cs120b = cs120b[~cs120b.index.duplicated(keep='first')]
+colunas_biomet = ['Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm']
+df = df.join(cs120b[colunas_biomet], how='left')
 
-# Engenharia de Features Sazonais
+# --- FUSÃO NDVI (Satélite) ---
+df = df.join(ndvi120[['NDVI_Medio', 'NDVI_Desvio']], how='left')
+df['NDVI_Medio'] = df['NDVI_Medio'].interpolate(method='time').bfill().ffill()
+df['NDVI_Desvio'] = df['NDVI_Desvio'].interpolate(method='time').bfill().ffill()
+
+# Engenharia de Features
+df['DOY'], df['Hour'], df['Month'] = df.index.dayofyear, df.index.hour, df.index.month
 df['is_day'] = ((df['Hour'] > 5) & (df['Hour'] < 19)).astype(int)
 df['Hour_sin'] = np.sin(2 * np.pi * df['Hour'] / 24)
 df['Hour_cos'] = np.cos(2 * np.pi * df['Hour'] / 24)
 df['DOY_sin']  = np.sin(2 * np.pi * df['DOY'] / 365)
 df['DOY_cos']  = np.cos(2 * np.pi * df['DOY'] / 365)
 
-# ------------------------------------------------------------------------------
-# FUSÃO DOS DADOS DO DATALOGGER (cs120b) COM O EDDYPRO (df)
-# ------------------------------------------------------------------------------
-# ATENÇÃO: Garanta que o cs120b já esteja carregado no seu ambiente e com o 
-# índice configurado como datetime antes de rodar esta etapa!
+# CONFIGURAÇÃO DE ALVO E FEATURES (Agora com NDVI!)
+target = 'FCH4'
+df[target] = df[target] / 1000 # nmol -> µmol
 
-# ---> REMOVENDO DUPLICATAS DO ARQUIVO DO DATALOGGER <---
-cs120b = cs120b.sort_index()
-cs120b = cs120b[~cs120b.index.duplicated(keep='first')]
-
-# Selecionamos as colunas de ouro e juntamos ao df principal
-colunas_biomet = ['Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm']
-df = df.join(cs120b[colunas_biomet], how='left')
-
-# ------------------------------------------------------------------------------
-# CONFIGURAÇÃO DE ALVO E CONVERSÃO
-# ------------------------------------------------------------------------------
-target = 'FCH4' 
-
-# ---> CONVERSÃO: nmol para µmol (dividindo por 1000) <---
-df[target] = df[target] / 1000
-
-feats = [
-    'TA_EP', 'VPD_EP', 'USTAR',           
-    'is_day', 'Hour_sin', 'Hour_cos',     
-    'DOY_sin', 'DOY_cos',                 
-    'Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm'
-]
+feats = ['TA_EP', 'VPD_EP', 'USTAR', 'is_day', 'Hour_sin', 'Hour_cos', 
+         'DOY_sin', 'DOY_cos', 'Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm',
+         'NDVI_Medio', 'NDVI_Desvio']
 
 # ==============================================================================
-# 2. QUALITY CONTROL ESPECÍFICO (CH4)
+# 2. QUALITY CONTROL & XGBOOST
 # ==============================================================================
-if 'FCH4_SSITC_TEST' in df.columns: 
-    df.loc[df['FCH4_SSITC_TEST'] == 2, target] = np.nan
-
-# Limites ajustados para a escala em µmol
+if 'FCH4_SSITC_TEST' in df.columns: df.loc[df['FCH4_SSITC_TEST'] == 2, target] = np.nan
 df.loc[(df[target] < -0.05) | (df[target] > 0.5), target] = np.nan 
 
 df['CH4_filled'] = df[target].copy()
 
-# ==============================================================================
-# 3. XGBOOST TRAINING
-# ==============================================================================
+# Treinamento
 clean = df.dropna(subset=feats + [target])
 X_train, X_test, y_train, y_test = train_test_split(clean[feats], clean[target], test_size=0.2, random_state=42)
-
 model = xgb.XGBRegressor(n_estimators=200, learning_rate=0.03, max_depth=5).fit(X_train, y_train)
 
 # ==============================================================================
-# 4. GAP FILLING (SEGURANÇA MÁXIMA - CORTANDO MALES PELA RAIZ)
+# 3. GAP FILLING (Lógica de Segurança Máxima)
 # ==============================================================================
-# 1. MAPEAMENTO DOS BURACOS ORIGINAIS (Antes de qualquer preenchimento)
 buracos_originais = df[target].isna()
-# Define buracos maiores que 24 horas (48 meias-horas) como "intocáveis"
 buracos_intocaveis = buracos_originais & (buracos_originais.groupby((~buracos_originais).cumsum()).transform('sum') > 48)
 
-# 2. Preenchimento via Machine Learning (onde há dados meteorológicos)
+# ML -> Interpolação curta -> MDC
 mask_ml = df['CH4_filled'].isna() & df[feats].notna().all(axis=1)
 df.loc[mask_ml, 'CH4_filled'] = model.predict(df.loc[mask_ml, feats])
-
-# 3. Interpolação curta para fechar buraquinhos (máximo 2 horas)
 df['CH4_filled'] = df['CH4_filled'].interpolate(method='time', limit=4)
-
-# 4. MDC (Mean Diurnal Cycle) para os buracos médios restantes
 mdc_ch4 = df.groupby(['Month', 'Hour'])['CH4_filled'].transform('mean')
 df.loc[df['CH4_filled'].isna(), 'CH4_filled'] = mdc_ch4
 
-# ---> 5. A MARRETADA FINAL <---
-# Apaga qualquer preenchimento (seja de ML ou MDC) que tenha caído em um buraco intocável
+# A Marretada Final
 df.loc[buracos_intocaveis, 'CH4_filled'] = np.nan
 
 # ==============================================================================
@@ -308,7 +324,6 @@ daily = df['CH4_filled'].resample('D').mean()
 
 plt.rcParams.update({'font.size': 11, 'font.family': 'serif'})
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, dpi=150)
-
 # Panel (a): Half-hourly
 ax1.plot(df.index, df['CH4_filled'], color='#ff7f0e', lw=0.6, label='Gap-filled (XGBoost + MDC)', alpha=0.9)
 ax1.plot(df.index, df[target], color='#1f77b4', lw=0.6, label='Measured', alpha=0.7)
@@ -316,7 +331,6 @@ ax1.set_ylabel('CH₄ Flux (µmol m⁻² s⁻¹)', fontweight='bold')
 ax1.set_title('(a) Half-hourly Methane Flux - CS120', loc='left', fontweight='bold')
 ax1.axhline(0, color='black', ls='-', lw=0.8)
 ax1.legend(loc='upper right', frameon=True, edgecolor='black')
-
 # Panel (b): Daily Mean
 ax2.plot(daily.index, daily, color='#2ca02c', lw=1.5, label='Daily Mean CH₄')
 ax2.set_ylabel('CH₄ Flux (µmol m⁻² s⁻¹)', fontweight='bold')
@@ -325,11 +339,9 @@ ax2.set_xlabel('Date', fontweight='bold')
 ax2.axhline(0, color='black', ls='-', lw=0.8)
 ax2.legend(loc='upper right', frameon=True, edgecolor='black')
 ax2.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
-
 for ax in [ax1, ax2]:
     ax.grid(True, ls=':', alpha=0.6, color='gray')
     ax.tick_params(axis='both', which='major', labelsize=10)
-
 plt.tight_layout()
 plt.show()
 
@@ -346,99 +358,67 @@ path = r"C:/Users/LabGEEPC001/Documents/LabGEE/EddyPro/outputeddypro/eddypro_CS_
 df = pd.read_csv(path, skiprows=[1], na_values=[-9999, -9999.0])
 df.index = pd.to_datetime(df['TIMESTAMP_START'].astype(str), format='%Y%m%d%H%M')
 
-# ---> REMOVENDO DUPLICATAS DO ARQUIVO FLUXNET <---
 df = df.sort_index()
 df = df[~df.index.duplicated(keep='first')]
 
-# Variáveis temporais originais
-df['DOY'], df['Hour'], df['Month'] = df.index.dayofyear, df.index.hour, df.index.month
+# --- FUSÃO BIOMET (Datalogger) ---
+cs130b = cs130b.sort_index()
+cs130b = cs130b[~cs130b.index.duplicated(keep='first')]
+colunas_biomet = ['Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm']
+df = df.join(cs130b[colunas_biomet], how='left')
 
-# Engenharia de Features Sazonais
+# --- FUSÃO NDVI (Satélite) ---
+df = df.join(ndvi130[['NDVI_Medio', 'NDVI_Desvio']], how='left')
+df['NDVI_Medio'] = df['NDVI_Medio'].interpolate(method='time').bfill().ffill()
+df['NDVI_Desvio'] = df['NDVI_Desvio'].interpolate(method='time').bfill().ffill()
+
+# Engenharia de Features
+df['DOY'], df['Hour'], df['Month'] = df.index.dayofyear, df.index.hour, df.index.month
 df['is_day'] = ((df['Hour'] > 5) & (df['Hour'] < 19)).astype(int)
 df['Hour_sin'] = np.sin(2 * np.pi * df['Hour'] / 24)
 df['Hour_cos'] = np.cos(2 * np.pi * df['Hour'] / 24)
 df['DOY_sin']  = np.sin(2 * np.pi * df['DOY'] / 365)
 df['DOY_cos']  = np.cos(2 * np.pi * df['DOY'] / 365)
 
-# ------------------------------------------------------------------------------
-# FUSÃO DOS DADOS DO DATALOGGER (cs130b) COM O EDDYPRO (df)
-# ------------------------------------------------------------------------------
-# ATENÇÃO: Garanta que o cs130b já esteja carregado no seu ambiente e com o 
-# índice configurado como datetime antes de rodar esta etapa!
-
-# ---> REMOVENDO DUPLICATAS DO ARQUIVO DO DATALOGGER <---
-cs130b = cs130b.sort_index()
-cs130b = cs130b[~cs130b.index.duplicated(keep='first')]
-
-# Selecionamos as colunas de ouro e juntamos ao df principal
-colunas_biomet = ['Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm']
-df = df.join(cs130b[colunas_biomet], how='left')
-
-# ------------------------------------------------------------------------------
-# CONFIGURAÇÃO DE ALVO E CONVERSÃO
-# ------------------------------------------------------------------------------
 target = 'FCH4' 
-
-# ---> CONVERSÃO: nmol para µmol (dividindo por 1000) <---
 df[target] = df[target] / 1000
 
-feats = [
-    'TA_EP', 'VPD_EP', 'USTAR',           
-    'is_day', 'Hour_sin', 'Hour_cos',     
-    'DOY_sin', 'DOY_cos',                 
-    'Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm'
-]
+feats = ['TA_EP', 'VPD_EP', 'USTAR', 'is_day', 'Hour_sin', 'Hour_cos', 
+         'DOY_sin', 'DOY_cos', 'Tsolo_5cm', 'H2Osolo_10cm', 'Rain_mm',
+         'NDVI_Medio', 'NDVI_Desvio']
 
 # ==============================================================================
-# 2. QUALITY CONTROL ESPECÍFICO (CH4)
+# 2. QUALITY CONTROL & XGBOOST
 # ==============================================================================
-if 'FCH4_SSITC_TEST' in df.columns: 
-    df.loc[df['FCH4_SSITC_TEST'] == 2, target] = np.nan
-
-# Limites ajustados para a escala em µmol
+if 'FCH4_SSITC_TEST' in df.columns: df.loc[df['FCH4_SSITC_TEST'] == 2, target] = np.nan
 df.loc[(df[target] < -0.05) | (df[target] > 0.5), target] = np.nan 
 
 df['CH4_filled'] = df[target].copy()
 
-# ==============================================================================
-# 3. XGBOOST TRAINING
-# ==============================================================================
 clean = df.dropna(subset=feats + [target])
 X_train, X_test, y_train, y_test = train_test_split(clean[feats], clean[target], test_size=0.2, random_state=42)
-
 model = xgb.XGBRegressor(n_estimators=200, learning_rate=0.03, max_depth=5).fit(X_train, y_train)
 
 # ==============================================================================
-# 4. GAP FILLING (SEGURANÇA MÁXIMA - CORTANDO MALES PELA RAIZ)
+# 3. GAP FILLING
 # ==============================================================================
-# 1. MAPEAMENTO DOS BURACOS ORIGINAIS (Antes de qualquer preenchimento)
 buracos_originais = df[target].isna()
-# Define buracos maiores que 24 horas (48 meias-horas) como "intocáveis"
 buracos_intocaveis = buracos_originais & (buracos_originais.groupby((~buracos_originais).cumsum()).transform('sum') > 48)
 
-# 2. Preenchimento via Machine Learning (onde há dados meteorológicos)
 mask_ml = df['CH4_filled'].isna() & df[feats].notna().all(axis=1)
 df.loc[mask_ml, 'CH4_filled'] = model.predict(df.loc[mask_ml, feats])
-
-# 3. Interpolação curta para fechar buraquinhos (máximo 2 horas)
 df['CH4_filled'] = df['CH4_filled'].interpolate(method='time', limit=4)
-
-# 4. MDC (Mean Diurnal Cycle) para os buracos médios restantes
 mdc_ch4 = df.groupby(['Month', 'Hour'])['CH4_filled'].transform('mean')
 df.loc[df['CH4_filled'].isna(), 'CH4_filled'] = mdc_ch4
 
-# ---> 5. A MARRETADA FINAL <---
-# Apaga qualquer preenchimento (seja de ML ou MDC) que tenha caído em um buraco intocável
 df.loc[buracos_intocaveis, 'CH4_filled'] = np.nan
 
 # ==============================================================================
 # 5. PUBLICATION-READY PLOT (2 PANELS)
 # ==============================================================================
 daily = df['CH4_filled'].resample('D').mean()
-
 plt.rcParams.update({'font.size': 11, 'font.family': 'serif'})
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, dpi=150)
-
 # Panel (a): Half-hourly
 ax1.plot(df.index, df['CH4_filled'], color='#ff7f0e', lw=0.6, label='Gap-filled (XGBoost + MDC)', alpha=0.9)
 ax1.plot(df.index, df[target], color='#1f77b4', lw=0.6, label='Measured', alpha=0.7)
@@ -446,7 +426,6 @@ ax1.set_ylabel('CH₄ Flux (µmol m⁻² s⁻¹)', fontweight='bold')
 ax1.set_title('(a) Half-hourly Methane Flux - CS130', loc='left', fontweight='bold')
 ax1.axhline(0, color='black', ls='-', lw=0.8)
 ax1.legend(loc='upper right', frameon=True, edgecolor='black')
-
 # Panel (b): Daily Mean
 ax2.plot(daily.index, daily, color='#2ca02c', lw=1.5, label='Daily Mean CH₄')
 ax2.set_ylabel('CH₄ Flux (µmol m⁻² s⁻¹)', fontweight='bold')
@@ -464,6 +443,46 @@ plt.tight_layout()
 plt.show()
 
 
+
+
+
+
+-------------------------------------------------------------------------------------------------------------
+Script do NDVI (deve ser adaptado ao seu caso com suas pastas e seus dados, claro)
+
+import rasterio
+import re
+
+def extrair_ndvi_da_pasta(caminho_pasta):
+    arquivos_tiff = glob.glob(os.path.join(caminho_pasta, '*.tiff'))
+    resultados = []
+    for caminho in arquivos_tiff:
+        nome_arquivo = os.path.basename(caminho)
+        # Pega a data (AAAA-MM-DD)
+        match_data = re.search(r'\d{4}-\d{2}-\d{2}', nome_arquivo)
+        
+        if match_data:
+            data_str = match_data.group()
+            with rasterio.open(caminho) as src:
+                matriz = src.read(1)
+                # Filtra apenas valores válidos de NDVI
+                validos = matriz[(matriz >= -1) & (matriz <= 1)]
+                if len(validos) > 0:
+                    resultados.append({
+                        'Data': data_str,
+                        'NDVI_Medio': np.mean(validos),
+                        'NDVI_Desvio': np.std(validos),
+                        'Qtd_Pixels': len(validos)})
+    df = pd.DataFrame(resultados)
+    if not df.empty:
+        df['Data'] = pd.to_datetime(df['Data'])
+        df = df.sort_values('Data').set_index('Data')
+    return df
+
+path_120 = r'C:\Users\LabGEEPC001\Documents\LabGEE\NDVIdata\CS120'
+path_130 = r'C:\Users\LabGEEPC001\Documents\LabGEE\NDVIdata\CS130'
+
+ndvi120 = extrair_ndvi_da_pasta(path_120)
 
 
 
